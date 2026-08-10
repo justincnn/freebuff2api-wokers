@@ -738,6 +738,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  const toolItems = new Map(); // 上游 tool_calls index → {id, callId, name, args}
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -755,6 +756,26 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
         const delta = choice.delta || {};
         if (delta.content) content += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolItems.get(ti);
+            if (!item) {
+              const fn = tc.function || {};
+              item = {
+                id: "fc_" + Math.random().toString(36).slice(2, 10),
+                callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+                name: fn.name || "",
+                args: "",
+              };
+              toolItems.set(ti, item);
+            }
+            const fn = tc.function || {};
+            if (fn.name && !item.name) item.name = fn.name;
+            if (fn.arguments) item.args += fn.arguments;
+          }
+        }
         if (choice.finish_reason) finishReason = choice.finish_reason;
         if (obj.id) id = obj.id;
         if (obj.model) model = obj.model;
@@ -765,6 +786,14 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const msg = { role: "assistant", content };
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
   else if (reasoning) msg.reasoning_content = reasoning;
+  // 修复：tool_calls 聚合（原实现只解析 content/reasoning，finish_reason=tool_calls 但 tool_calls 丢失）
+  if (toolItems.size > 0) {
+    msg.tool_calls = [...toolItems.values()].map((item) => ({
+      id: item.callId,
+      type: "function",
+      function: { name: item.name, arguments: item.args },
+    }));
+  }
   return {
     id: id || "gen_" + Date.now(),
     object: "chat.completion",
