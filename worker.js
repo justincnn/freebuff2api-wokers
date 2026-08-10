@@ -1434,11 +1434,20 @@ async function refresh(){
   document.getElementById('s-cached').textContent=(s.cached_tokens||0).toLocaleString();
   document.getElementById('s-output').textContent=(s.output_tokens||0).toLocaleString();
   const tb=document.getElementById('acct-tbody');tb.innerHTML='';
-  (d.accounts.list||[]).forEach(a=>{
-    const st=a.cooling?'<span class="chip cool">冷却中</span>':'<span class="chip ok">正常</span>';
-    const btn=a.cooling?'<button onclick="clearCd(\''+a.token+'\')">解除冷却</button>':'<button onclick="delAcct(\''+a.token+'\')">清理</button>';
-    tb.insertAdjacentHTML('beforeend','<tr><td>'+a.token+'</td><td>'+(a.uid||'-')+'</td><td>'+st+'</td><td>'+btn+'</td></tr>');
-  });
+    (d.accounts.list||[]).forEach(a=>{
+      const st=a.cooling?'<span class="chip cool">冷却中</span>':'<span class="chip ok">正常</span>';
+      const tr=document.createElement('tr');
+      const td1=document.createElement('td');td1.textContent=a.token;
+      const td2=document.createElement('td');td2.textContent=a.uid||'-';
+      const td3=document.createElement('td');td3.innerHTML=st;
+      const td4=document.createElement('td');
+      const btn=document.createElement('button');
+      btn.textContent=a.cooling?'解除冷却':'清理';
+      btn.onclick=()=>{ if(a.cooling){ clearCd(a.token); } else { delAcct(a.token); } };
+      td4.appendChild(btn);
+      tr.appendChild(td1);tr.appendChild(td2);tr.appendChild(td3);tr.appendChild(td4);
+      tb.appendChild(tr);
+    });
   document.getElementById('models').innerHTML=(d.models||[]).map(m=>'<span class="chip ok" style="margin:2px">'+m+'</span>').join(' ');
   // 设置页
   document.getElementById('cfg-api-key').value=d.api_key||'';
