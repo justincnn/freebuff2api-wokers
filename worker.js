@@ -114,6 +114,18 @@ export default {
       if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
       return handleAdminConfig(request, env);
     }
+    if (url.pathname === "/admin/api/auth-codes" && request.method === "POST") {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handleCreateAuthCode(env);
+    }
+    if (url.pathname === "/admin/api/auth-codes" && request.method === "GET") {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handleListAuthCodes(env);
+    }
+    if (url.pathname === "/admin/api/auth-codes/poll" && request.method === "GET") {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handlePollAuthCodes(env);
+    }
     if (url.pathname.startsWith("/admin/api/accounts/")) {
       if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
       return handleAdminAccountAction(request, url, env);
@@ -576,7 +588,9 @@ async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
-  const mc = MODELS.find((m) => m.id === (params.model || DEFAULT_MODEL)) || MODELS[0];
+  const rc = await loadRuntimeConfig(env);
+  const defaultModel = (rc.default_model || env.DEFAULT_MODEL || DEFAULT_MODEL);
+  const mc = MODELS.find((m) => m.id === (params.model || defaultModel)) || MODELS[0];
   return executeChat(env, params, mc, isStream, "chat");
 }
 
@@ -585,7 +599,9 @@ async function handleResponses(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
-  const mc = MODELS.find((m) => m.id === (params.model || DEFAULT_MODEL)) || MODELS[0];
+  const rc = await loadRuntimeConfig(env);
+  const defaultModel = (rc.default_model || env.DEFAULT_MODEL || DEFAULT_MODEL);
+  const mc = MODELS.find((m) => m.id === (params.model || defaultModel)) || MODELS[0];
   return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
 }
 
@@ -665,7 +681,15 @@ function responsesInputToMessages(input, instructions) {
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
 async function executeChat(env, chatParams, mc, isStream, mode) {
   const debug = env.FREEBUFF_DEBUG === "true";
-  const pool = parseAccounts(env);
+  // 账号池: env.FREEBUFF_TOKEN + KV 授权账号合并
+  const envPool = parseAccounts(env);
+  let kvAccounts = [];
+  try { kvAccounts = await loadAccountsFromKV(env); } catch {}
+  const seen = new Set(envPool.map((a) => a.token));
+  for (const ka of kvAccounts) {
+    if (!seen.has(ka.token)) { envPool.push({ token: ka.token, uid: ka.uid || null }); seen.add(ka.token); }
+  }
+  const pool = envPool;
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
 
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
@@ -1233,8 +1257,15 @@ async function handleAdminStats(request, env) {
   today.cached_tokens += statsBuf.cached_tokens;
   today.output_tokens += statsBuf.output_tokens;
 
-  // 账号状态
-  const accounts = parseAccounts(env).map((a) => {
+  // 账号状态: env + KV 授权账号合并
+  const envAccounts = parseAccounts(env);
+  let kvList = [];
+  try { kvList = await loadAccountsFromKV(env); } catch {}
+  const seenT = new Set(envAccounts.map((a) => a.token));
+  for (const ka of kvList) {
+    if (!seenT.has(ka.token)) { envAccounts.push({ token: ka.token, uid: ka.uid || null }); seenT.add(ka.token); }
+  }
+  const accounts = envAccounts.map((a) => {
     const cd = cooldowns.get(a.token) || 0;
     const cooling = cd > Date.now();
     return {
@@ -1281,6 +1312,132 @@ async function loadRuntimeConfig(env) {
     const cur = await env.STATS_KV.get("fb2api:config");
     return cur ? JSON.parse(cur) : {};
   } catch { return {}; }
+}
+
+// ---------------------------------------------------------------------------
+// 上游 token 管理(授权 URL 流程, 对齐 freebuff-proxy)
+// 1. POST /admin/api/auth-codes → 调上游生成 loginUrl
+// 2. 用户打开 loginUrl 授权
+// 3. GET /admin/api/auth-codes/poll → 轮询状态, 授权成功提取 authToken 落库
+// ---------------------------------------------------------------------------
+const FREEBUFF_LOGIN_BASE = "https://freebuff.com";
+const AUTH_CODE_TTL = 6 * 60 * 60; // 6h
+
+function genFingerprintId() {
+  const rand = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18);
+  return "worker-" + rand;
+}
+
+async function handleCreateAuthCode(env) {
+  if (!env.STATS_KV) return jsonResponse({ error: { message: "no kv" } }, 500);
+  const fingerprintId = genFingerprintId();
+  try {
+    const resp = await fetch(`${FREEBUFF_LOGIN_BASE}/api/auth/cli/code`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fingerprintId }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) return jsonResponse({ error: { message: "上游 loginCode 失败: " + resp.status } }, 502);
+    const code = await resp.json();
+    if (!code || !code.loginUrl) return jsonResponse({ error: { message: "上游未返回 loginUrl" } }, 502);
+    const rec = {
+      id: fingerprintId,
+      loginUrl: code.loginUrl,
+      fingerprintId,
+      fingerprintHash: code.fingerprintHash || "",
+      expiresAt: code.expiresAt || "",
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    await env.STATS_KV.put(`auth_code:${rec.id}`, JSON.stringify(rec), { expirationTtl: AUTH_CODE_TTL });
+    return jsonResponse({ ok: true, code: rec });
+  } catch (e) {
+    return jsonResponse({ error: { message: String(e.message || e) } }, 502);
+  }
+}
+
+async function handleListAuthCodes(env) {
+  if (!env.STATS_KV) return jsonResponse({ error: { message: "no kv" } }, 500);
+  const codes = [];
+  try {
+    const res = await env.STATS_KV.list({ prefix: "auth_code:" });
+    for (const key of res.keys) {
+      const raw = await env.STATS_KV.get(key.name);
+      if (raw) { try { codes.push(JSON.parse(raw)); } catch {} }
+    }
+    codes.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  } catch {}
+  return jsonResponse({ ok: true, codes });
+}
+
+async function handlePollAuthCodes(env) {
+  if (!env.STATS_KV) return jsonResponse({ error: { message: "no kv" } }, 500);
+  const res = await env.STATS_KV.list({ prefix: "auth_code:" });
+  let changed = false;
+  const results = [];
+  for (const key of res.keys) {
+    const raw = await env.STATS_KV.get(key.name);
+    if (!raw) continue;
+    let rec;
+    try { rec = JSON.parse(raw); } catch { continue; }
+    if (rec.status !== "pending") continue;
+    // 轮询上游登录状态
+    try {
+      const qs = new URLSearchParams({ fingerprintId: rec.fingerprintId, fingerprintHash: rec.fingerprintHash || "", expiresAt: rec.expiresAt || "" });
+      const r = await fetch(`${FREEBUFF_LOGIN_BASE}/api/auth/cli/status?${qs}`, {
+        method: "GET", signal: AbortSignal.timeout(15000),
+      });
+      if (r.status === 401) continue; // 仍 pending
+      if (!r.ok) { rec.status = "failed"; changed = true; }
+      else {
+        const data = await r.json();
+        const user = data && data.user;
+        const token = user && (user.authToken || user.token || "");
+        if (token) {
+          rec.status = "authorized";
+          rec.email = user.email || "";
+          rec.name = user.name || "";
+          rec.uid = user.id || user.uid || "";
+          rec.token = token;
+          changed = true;
+          // 落库到账号列表
+          await addAccountToKV(env, token, rec.uid);
+        } else {
+          rec.status = "failed";
+          rec.error = "授权响应无 token";
+          changed = true;
+        }
+      }
+      await env.STATS_KV.put(`auth_code:${rec.id}`, JSON.stringify(rec), { expirationTtl: AUTH_CODE_TTL });
+      results.push({ id: rec.id, status: rec.status, email: rec.email || null });
+    } catch (e) {
+      rec.error = String(e.message || e);
+      await env.STATS_KV.put(`auth_code:${rec.id}`, JSON.stringify(rec), { expirationTtl: AUTH_CODE_TTL });
+    }
+  }
+  return jsonResponse({ ok: true, changed, results });
+}
+
+// KV 账号列表: fb2api:accounts = JSON 数组 [{token, uid, addedAt}]
+async function addAccountToKV(env, token, uid) {
+  try {
+    let accounts = [];
+    const cur = await env.STATS_KV.get("fb2api:accounts");
+    if (cur) { try { accounts = JSON.parse(cur); } catch {} }
+    if (!accounts.some((a) => a.token === token)) {
+      accounts.push({ token, uid: uid || "", addedAt: new Date().toISOString() });
+      await env.STATS_KV.put("fb2api:accounts", JSON.stringify(accounts), { expirationTtl: 60 * 60 * 24 * 365 });
+    }
+  } catch {}
+}
+
+async function loadAccountsFromKV(env) {
+  if (!env.STATS_KV) return [];
+  try {
+    const cur = await env.STATS_KV.get("fb2api:accounts");
+    return cur ? JSON.parse(cur) : [];
+  } catch { return []; }
 }
 
 async function handleAdminAccountAction(request, url, env) {
@@ -1375,6 +1532,7 @@ label{display:block;color:var(--dim);font-size:11px;margin-top:8px}
 </div>
 <div class="tabs">
   <div class="tab active" data-tab="overview" onclick="switchTab('overview')">总览</div>
+  <div class="tab" data-tab="tokens" onclick="switchTab('tokens')">Token 管理</div>
   <div class="tab" data-tab="settings" onclick="switchTab('settings')">设置</div>
 </div>
 
@@ -1390,6 +1548,19 @@ label{display:block;color:var(--dim);font-size:11px;margin-top:8px}
 <tbody id="acct-tbody"><tr><td colspan="4" style="color:var(--dim)">加载中...</td></tr></tbody></table>
 </div></div>
 <div class="card"><h3>可用模型</h3><div class="body" id="models"><span style="color:var(--dim)">-</span></div></div>
+</div>
+
+<div id="tab-tokens" class="hidden">
+<div class="card"><h3>授权新账号 (获取上游 token)</h3><div class="body">
+  <button onclick="createAuthCode()">生成授权链接</button>
+  <div class="usage" id="auth-url-box" style="margin-top:8px"></div>
+  <div class="usage" id="auth-tip" style="margin-top:4px"></div>
+</div></div>
+<div class="card"><h3>账号 Token 列表</h3><div class="body">
+<table><thead><tr><th>邮箱</th><th>状态</th><th>Token</th><th>操作</th></tr></thead>
+<tbody id="auth-tbody"><tr><td colspan="4" style="color:var(--dim)">加载中...</td></tr></tbody></table>
+  <button onclick="pollAuth()" style="margin-top:8px">轮询授权状态</button>
+</div></div>
 </div>
 
 <div id="tab-settings" class="hidden">
@@ -1424,6 +1595,7 @@ function switchTab(t){
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
   document.getElementById('tab-overview').classList.toggle('hidden',t!=='overview');
   document.getElementById('tab-settings').classList.toggle('hidden',t!=='settings');
+  document.getElementById('tab-tokens').classList.toggle('hidden',t!=='tokens');
 }
 async function refresh(){
   const d=await api('/admin/api/stats');if(!d)return;
@@ -1453,7 +1625,50 @@ async function refresh(){
   document.getElementById('cfg-api-key').value=d.api_key||'';
   const sel=document.getElementById('cfg-default-model');sel.innerHTML='';
   (d.models||[]).forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;if(m===d.default_model)o.selected=true;sel.appendChild(o);});
+  loadAuthCodes();
   document.getElementById('usage-text').innerHTML='<b>Base URL:</b> <span style="color:var(--cyan)">https://freebuff.chat2api.kdns.fr/v1</span><br><b>API Key:</b> <span style="color:var(--cyan)">'+d.api_key+'</span><br><b>健康检查:</b> /healthz（免鉴权）<br><b>兼容:</b> OpenAI Chat Completions / Responses API, 支持 tools call';
+}
+async function createAuthCode(){
+  document.getElementById('auth-url-box').innerHTML='<span style="color:var(--dim)">生成中...</span>';
+  const d=await api('/admin/api/auth-codes',{method:'POST'});
+  if(d&&d.ok&&d.code&&d.code.loginUrl){
+    document.getElementById('auth-url-box').innerHTML='<a href="'+d.code.loginUrl+'" target="_blank" style="word-break:break-all">打开授权链接登录 Freebuff</a><br><span style="color:var(--dim);font-size:11px">'+d.code.loginUrl+'</span>';
+    document.getElementById('auth-tip').innerHTML='<span style="color:var(--amber)">请在浏览器打开链接完成授权, 然后点"轮询授权状态"</span>';
+  }else if(d&&d.error){document.getElementById('auth-url-box').innerHTML='<span style="color:var(--red)">'+d.error.message+'</span>';}
+  else{document.getElementById('auth-url-box').innerHTML='<span style="color:var(--red)">生成失败(请检查密码)</span>';}
+}
+async function loadAuthCodes(){
+  const d=await api('/admin/api/auth-codes');if(!d)return;
+  const tb=document.getElementById('auth-tbody');tb.innerHTML='';
+  const codes=(d.codes||[]).slice(0,10);
+  if(codes.length===0){tb.innerHTML='<tr><td colspan="4" style="color:var(--dim)">暂无授权记录</td></tr>';return;}
+  codes.forEach(c=>{
+    const tr=document.createElement('tr');
+    const td1=document.createElement('td');td1.textContent=c.email||'-';
+    const td2=document.createElement('td');
+    const stMap={pending:'<span class="chip cool">等待授权</span>',authorized:'<span class="chip ok">已授权</span>',failed:'<span class="chip err">失败</span>'};
+    td2.innerHTML=stMap[c.status]||'<span class="chip cool">'+c.status+'</span>';
+    const td3=document.createElement('td');td3.textContent=c.token?(c.token.slice(0,10)+'...'):'-';td3.style.color='var(--dim)';
+    const td4=document.createElement('td');
+    if(c.status==='pending'&&c.loginUrl){
+      const a=document.createElement('button');a.textContent='打开授权';
+      a.onclick=()=>window.open(c.loginUrl,'_blank');td4.appendChild(a);
+    }
+    tr.appendChild(td1);tr.appendChild(td2);tr.appendChild(td3);tr.appendChild(td4);
+    tb.appendChild(tr);
+  });
+}
+async function pollAuth(){
+  const btn=event&&event.target?event.target:null;
+  if(btn){btn.disabled=true;btn.textContent='轮询中...';}
+  const d=await api('/admin/api/auth-codes/poll');if(!d){if(btn){btn.disabled=false;btn.textContent='轮询授权状态';}return;}
+  if(d.changed){
+    document.getElementById('auth-tip').innerHTML='<span style="color:var(--green)">检测到新授权, 账号已添加!</span>';
+    loadAuthCodes();refresh();
+  }else{
+    document.getElementById('auth-tip').innerHTML='<span style="color:var(--dim)">暂无新授权(可重复点击轮询)</span>';
+  }
+  if(btn){btn.disabled=false;btn.textContent='轮询授权状态';}
 }
 async function saveConfig(){
   const body={api_key:document.getElementById('cfg-api-key').value,default_model:document.getElementById('cfg-default-model').value};
