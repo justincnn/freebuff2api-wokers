@@ -110,12 +110,16 @@ export default {
       if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
       return handleAdminStats(request, env);
     }
+    if (url.pathname === "/admin/api/config" && request.method === "POST") {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handleAdminConfig(request, env);
+    }
     if (url.pathname.startsWith("/admin/api/accounts/")) {
       if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
       return handleAdminAccountAction(request, url, env);
     }
 
-    const key = getApiKey(request, env);
+    const key = await getApiKey(request, env);
     if (!key) return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
 
     cleanCache();
@@ -1176,12 +1180,23 @@ function handleModels() {
   }, 200, { "X-Freebuff2api-Version": "1.6.6" });
 }
 
-function getApiKey(request, env) {
+async function getApiKey(request, env) {
+  let expectedOverride = null;
   const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
-  if (!expected) return null;
+  // 运行时覆盖(KV 配置优先)
+  try {
+    if (env.STATS_KV) {
+      const cur = await env.STATS_KV.get("fb2api:config");
+      if (cur) {
+        const rc = JSON.parse(cur);
+        if (rc.api_key && rc.api_key.trim()) expectedOverride = rc.api_key.trim();
+      }
+    }
+  } catch {}
+  const check = expectedOverride || expected;
   const auth = request.headers.get("Authorization") || "";
-  if (auth.startsWith("Bearer ")) return auth.slice(7) === expected ? expected : null;
-  return request.headers.get("x-api-key") === expected ? expected : null;
+  if (auth.startsWith("Bearer ")) return auth.slice(7) === check ? check : null;
+  return request.headers.get("x-api-key") === check ? check : null;
 }
 
 function jsonResponse(obj, status, extraHeaders = {}) {
@@ -1236,7 +1251,36 @@ async function handleAdminStats(request, env) {
     stats: { date: new Date().toISOString().slice(0, 10), ...today },
     accounts: { total: accounts.length, list: accounts },
     models: MODELS.map((m) => m.id),
+    api_key: (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY),
+    default_model: (env.DEFAULT_MODEL || DEFAULT_MODEL),
   });
+}
+
+// 保存服务配置到 KV(api_key / default_model 运行时覆盖 env)
+async function handleAdminConfig(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  // 持久化到 KV, 后续 stats/chat 读取时覆盖
+  if (!env.STATS_KV) return jsonResponse({ ok: false, error: "no kv" }, 500);
+  const key = "fb2api:config";
+  let cfg = {};
+  try {
+    const cur = await env.STATS_KV.get(key);
+    if (cur) cfg = JSON.parse(cur);
+  } catch {}
+  if (typeof body.api_key === "string" && body.api_key.trim()) cfg.api_key = body.api_key.trim();
+  if (typeof body.default_model === "string" && body.default_model.trim()) cfg.default_model = body.default_model.trim();
+  await env.STATS_KV.put(key, JSON.stringify(cfg), { expirationTtl: 60 * 60 * 24 * 365 });
+  return jsonResponse({ ok: true, config: cfg });
+}
+
+// 读取运行时覆盖配置(chat 入口用)
+async function loadRuntimeConfig(env) {
+  if (!env.STATS_KV) return {};
+  try {
+    const cur = await env.STATS_KV.get("fb2api:config");
+    return cur ? JSON.parse(cur) : {};
+  } catch { return {}; }
 }
 
 async function handleAdminAccountAction(request, url, env) {
@@ -1280,6 +1324,9 @@ body{background:var(--bg);background-image:linear-gradient(rgba(34,211,238,.04) 
 .logo span{display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;background:var(--cyan);color:#04121f;border-radius:4px;margin-right:8px;font-weight:800}
 .spacer{flex:1}
 .badge{background:rgba(34,211,238,.12);color:var(--cyan);border:1px solid rgba(34,211,238,.3);padding:3px 10px;border-radius:999px;font-size:11px}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tab{padding:6px 16px;border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--dim);background:var(--panel);font-family:var(--mono);font-size:12px}
+.tab.active{color:var(--cyan);border-color:rgba(34,211,238,.5);background:rgba(34,211,238,.08)}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px}
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
 .stat .label{color:var(--dim);font-size:11px;letter-spacing:1px;text-transform:uppercase}
@@ -1297,24 +1344,41 @@ tr:last-child td{border-bottom:none}
 .chip.ok{color:var(--green);border-color:rgba(52,211,153,.4)}
 .chip.cool{color:var(--amber);border-color:rgba(251,191,36,.4)}
 .chip.err{color:var(--red);border-color:rgba(248,113,113,.4)}
-.btns{display:flex;gap:8px}
 button{background:rgba(34,211,238,.1);color:var(--cyan);border:1px solid rgba(34,211,238,.35);border-radius:5px;padding:4px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
 button:hover{background:rgba(34,211,238,.22)}
+input,select{width:100%;background:#081426;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:8px 12px;font-family:var(--mono);font-size:12px;margin:4px 0}
 .login-box{max-width:340px;margin:15vh auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}
 .login-box h2{color:var(--cyan);font-size:16px;margin-bottom:16px}
-input{width:100%;background:#081426;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:9px 12px;font-family:var(--mono);font-size:13px;margin-bottom:12px}
+.login-box .err{color:var(--red);font-size:12px;min-height:16px;margin-bottom:8px}
 .usage{color:var(--dim);font-size:11px;margin-top:8px;line-height:1.6}
-a{color:var(--cyan)}
+.hidden{display:none}
+label{display:block;color:var(--dim);font-size:11px;margin-top:8px}
 </style>
 </head>
 <body>
-<div class="wrap" id="app">
+<!-- 登录框 -->
+<div class="login-box" id="login-box">
+  <h2>🔐 FREEBUFF2API 管理台</h2>
+  <div class="err" id="login-err"></div>
+  <input type="password" id="login-pass" placeholder="输入管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
+  <button style="width:100%" onclick="doLogin()">登录</button>
+</div>
+
+<!-- 主界面 -->
+<div class="wrap hidden" id="app">
 <div class="titlebar">
   <div class="logo"><span>F</span>FREEBUFF2API</div>
   <div class="badge" id="ver">-</div>
   <div class="spacer"></div>
   <button onclick="refresh()">刷新</button>
+  <button onclick="logout()">退出</button>
 </div>
+<div class="tabs">
+  <div class="tab active" data-tab="overview" onclick="switchTab('overview')">总览</div>
+  <div class="tab" data-tab="settings" onclick="switchTab('settings')">设置</div>
+</div>
+
+<div id="tab-overview">
 <div class="stats-grid">
   <div class="stat"><div class="label">调用次数</div><div class="value" id="s-calls">-</div></div>
   <div class="stat"><div class="label">输入 Tokens</div><div class="value" id="s-prompt">-</div></div>
@@ -1326,23 +1390,40 @@ a{color:var(--cyan)}
 <tbody id="acct-tbody"><tr><td colspan="4" style="color:var(--dim)">加载中...</td></tr></tbody></table>
 </div></div>
 <div class="card"><h3>可用模型</h3><div class="body" id="models"><span style="color:var(--dim)">-</span></div></div>
-<div class="card"><h3>使用说明</h3><div class="body usage">
-<b>Base URL:</b> <span style="color:var(--cyan)">https://freebuff.chat2api.kdns.fr/v1</span><br>
-<b>API Key:</b> <span style="color:var(--cyan)">freebuff-default-key</span><br>
-<b>模型示例:</b> deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro, minimax/minimax-m3, mimo/mimo-v2.5, openai/gpt-5.6-luna, z-ai/glm-5.2, anthropic/claude-fable-5 等<br>
-<b>健康检查:</b> <span style="color:var(--cyan)">/healthz</span>（免鉴权）<br>
-<b>兼容:</b> OpenAI Chat Completions / Responses API, 支持 tools call(含 end_turn 签名)<br>
-<b>说明:</b> 统计按日聚合, KV 每 5 分钟批量写入一次(免费额度内)
-</div></div>
 </div>
+
+<div id="tab-settings" class="hidden">
+<div class="card"><h3>服务配置</h3><div class="body">
+  <label>API 访问密钥 (FREEBUFF_API_KEY)</label>
+  <input id="cfg-api-key" placeholder="调用 API 时的 key">
+  <label>默认模型</label>
+  <select id="cfg-default-model"></select>
+  <button onclick="saveConfig()" style="margin-top:10px">保存配置</button>
+  <div class="usage" id="cfg-msg"></div>
+</div></div>
+<div class="card"><h3>使用说明</h3><div class="body usage" id="usage-text"></div></div>
+</div>
+</div>
+
 <script>
 let KEY=localStorage.getItem('fb2a-key')||'';
+function showApp(){document.getElementById('login-box').classList.add('hidden');document.getElementById('app').classList.remove('hidden');}
+function showLogin(){document.getElementById('login-box').classList.remove('hidden');document.getElementById('app').classList.add('hidden');}
+function doLogin(){const k=document.getElementById('login-pass').value;document.getElementById('login-err').textContent='';if(!k)return;KEY=k;verifyKey();}
+function logout(){localStorage.removeItem('fb2a-key');KEY='';showLogin();}
+async function verifyKey(){const d=await api('/admin/api/stats');if(d){localStorage.setItem('fb2a-key',KEY);showApp();refresh();}else{document.getElementById('login-err').textContent='密码错误, 请重试';}}
 async function api(path,opt){
-  if(!KEY){const k=prompt('输入管理员密码:');if(!k)return;KEY=k;localStorage.setItem('fb2a-key',k);}
   opt=opt||{};opt.headers=Object.assign({'x-admin-auth':KEY},opt.headers||{});
-  const r=await fetch(path,opt);
-  if(r.status===401){localStorage.removeItem('fb2a-key');KEY='';alert('密码错误');return null;}
-  return r.json();
+  try{
+    const r=await fetch(path,opt);
+    if(r.status===401){return null;}
+    return r.json();
+  }catch(e){return null;}
+}
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
+  document.getElementById('tab-overview').classList.toggle('hidden',t!=='overview');
+  document.getElementById('tab-settings').classList.toggle('hidden',t!=='settings');
 }
 async function refresh(){
   const d=await api('/admin/api/stats');if(!d)return;
@@ -1359,10 +1440,20 @@ async function refresh(){
     tb.insertAdjacentHTML('beforeend','<tr><td>'+a.token+'</td><td>'+(a.uid||'-')+'</td><td>'+st+'</td><td>'+btn+'</td></tr>');
   });
   document.getElementById('models').innerHTML=(d.models||[]).map(m=>'<span class="chip ok" style="margin:2px">'+m+'</span>').join(' ');
+  // 设置页
+  document.getElementById('cfg-api-key').value=d.api_key||'';
+  const sel=document.getElementById('cfg-default-model');sel.innerHTML='';
+  (d.models||[]).forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;if(m===d.default_model)o.selected=true;sel.appendChild(o);});
+  document.getElementById('usage-text').innerHTML='<b>Base URL:</b> <span style="color:var(--cyan)">https://freebuff.chat2api.kdns.fr/v1</span><br><b>API Key:</b> <span style="color:var(--cyan)">'+d.api_key+'</span><br><b>健康检查:</b> /healthz（免鉴权）<br><b>兼容:</b> OpenAI Chat Completions / Responses API, 支持 tools call';
+}
+async function saveConfig(){
+  const body={api_key:document.getElementById('cfg-api-key').value,default_model:document.getElementById('cfg-default-model').value};
+  const d=await api('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  document.getElementById('cfg-msg').textContent=d&&d.ok?'✅ 已保存':'保存失败';
 }
 async function clearCd(t){await api('/admin/api/accounts/'+encodeURIComponent(t)+'/clear-cooldown',{method:'POST'});refresh();}
 async function delAcct(t){if(confirm('确认清理该账号的本地会话?')){await api('/admin/api/accounts/'+encodeURIComponent(t)+'/delete',{method:'POST'});refresh();}}
-refresh();setInterval(refresh,30000);
+if(KEY)verifyKey();else showLogin();
 </script>
 </body>
 </html>`;
