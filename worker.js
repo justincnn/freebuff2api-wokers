@@ -1207,7 +1207,7 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-freebuff-instance-id, anthropic-version, anthropic-beta",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-admin-auth, x-freebuff-instance-id, anthropic-version, anthropic-beta",
   };
 }
 
