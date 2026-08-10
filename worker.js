@@ -454,6 +454,23 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
+  // reasoning 归一化（移植 freebuff-proxy）：OpenAI/Freebuff 拒绝同时携带
+  // reasoning_effort 与 reasoning.effort 双字段（尤其值不同时）；Freebuff 还会
+  // 对裸 reasoning_effort 注入默认 effort 导致冲突。折叠为单一 reasoning.effort，
+  // max → high（对应上游 catalog 顶层档位）。
+  if (payload.reasoning_effort !== undefined || (payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort !== undefined)) {
+    const fromTop = typeof payload.reasoning_effort === "string" ? payload.reasoning_effort : null;
+    const fromNested = payload.reasoning && typeof payload.reasoning === "object" && typeof payload.reasoning.effort === "string" ? payload.reasoning.effort : null;
+    const effort = fromTop || fromNested;
+    if (effort) {
+      const mapped = effort === "max" ? "high" : effort;
+      delete payload.reasoning_effort;
+      payload.reasoning = {
+        ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
+        effort: mapped,
+      };
+    }
+  }
   // v1.6.4：外来客户端检测绕过。服务端 detectForeignFreebuffClient 对「带 tools 但无官方
   // 专属工具名」的请求判定 foreign_toolset，降级到 ling-3.0-tiny:free（占免费额度→429）。
   // 实测（2026-08-09）：tools 里混入官方专属名（end_turn，TOOLS_WHICH_WONT_FORCE_NEXT_STEP
