@@ -1205,22 +1205,41 @@ function handleModels() {
 }
 
 async function getApiKey(request, env) {
-  let expectedOverride = null;
-  const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
-  // 运行时覆盖(KV 配置优先)
-  try {
-    if (env.STATS_KV) {
-      const cur = await env.STATS_KV.get("fb2api:config");
-      if (cur) {
-        const rc = JSON.parse(cur);
-        if (rc.api_key && rc.api_key.trim()) expectedOverride = rc.api_key.trim();
+  // api_key 解析: 内存缓存 → KV → env → 默认
+  // 冷启动(或 deploy)后首次请求读 KV 并缓存, 之后用缓存, 避免 KV 抖动导致 401
+  const cached = getCachedApiKey();
+  let check = cached || (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
+  if (!cached) {
+    try {
+      if (env.STATS_KV) {
+        const cur = await env.STATS_KV.get("fb2api:config");
+        if (cur) {
+          const rc = JSON.parse(cur);
+          if (rc.api_key && rc.api_key.trim()) {
+            check = rc.api_key.trim();
+            setCachedApiKey(check);
+          }
+        }
       }
-    }
-  } catch {}
-  const check = expectedOverride || expected;
+    } catch {}
+  }
   const auth = request.headers.get("Authorization") || "";
   if (auth.startsWith("Bearer ")) return auth.slice(7) === check ? check : null;
   return request.headers.get("x-api-key") === check ? check : null;
+}
+
+// api_key 内存缓存(模块级, Worker 生命周期内有效)
+let cachedApiKey = null;
+let cachedApiKeyTs = 0;
+const API_KEY_CACHE_MS = 5 * 60 * 1000; // 5 分钟刷新一次, 让界面改 key 后能生效
+
+function getCachedApiKey() {
+  if (cachedApiKey && Date.now() - cachedApiKeyTs < API_KEY_CACHE_MS) return cachedApiKey;
+  return null; // 过期则重新从 KV 读
+}
+function setCachedApiKey(key) {
+  cachedApiKey = key;
+  cachedApiKeyTs = Date.now();
 }
 
 function jsonResponse(obj, status, extraHeaders = {}) {
@@ -1305,6 +1324,8 @@ async function handleAdminConfig(request, env) {
   if (typeof body.api_key === "string" && body.api_key.trim()) cfg.api_key = body.api_key.trim();
   if (typeof body.default_model === "string" && body.default_model.trim()) cfg.default_model = body.default_model.trim();
   await env.STATS_KV.put(key, JSON.stringify(cfg), { expirationTtl: 60 * 60 * 24 * 365 });
+  // 立即刷新 api_key 内存缓存(无需等 5 分钟)
+  if (cfg.api_key) setCachedApiKey(cfg.api_key);
   return jsonResponse({ ok: true, config: cfg });
 }
 
