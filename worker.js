@@ -1276,14 +1276,17 @@ async function handleAdminStats(request, env) {
     };
   });
 
+  // 运行时配置(KV 优先, 与 chat 入口一致)
+  const rc = await loadRuntimeConfig(env);
+
   return jsonResponse({
     version: "1.6.6",
     time: new Date().toISOString(),
     stats: { date: new Date().toISOString().slice(0, 10), ...today },
     accounts: { total: accounts.length, list: accounts },
     models: MODELS.map((m) => m.id),
-    api_key: (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY),
-    default_model: (env.DEFAULT_MODEL || DEFAULT_MODEL),
+    api_key: (rc.api_key || env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY),
+    default_model: (rc.default_model || env.DEFAULT_MODEL || DEFAULT_MODEL),
   });
 }
 
