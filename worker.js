@@ -3,6 +3,60 @@ const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
+// ---------------------------------------------------------------------------
+// 统计模块: 内存累计 + 定时批量写 KV, 避免每请求写 KV(免费层写 1000 次/天)
+// 统计项: 调用次数 / 输入 tokens / 缓存 tokens / 输出 tokens(按日聚合)
+// ---------------------------------------------------------------------------
+const STATS_FLUSH_MS = 5 * 60 * 1000;   // 5 分钟批量写一次 (≈288 写/天, 远低于免费上限)
+const STATS_KEY_PREFIX = "fb2api:stats:";
+let statsBuf = { calls: 0, prompt_tokens: 0, cached_tokens: 0, output_tokens: 0 };
+let lastStatsFlush = 0;
+let statsTimer = null;
+
+function statsKey(date = new Date()) {
+  const d = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return STATS_KEY_PREFIX + d;
+}
+
+function recordStats(usage) {
+  const u = usage || {};
+  statsBuf.calls += 1;
+  statsBuf.prompt_tokens += Number(u.prompt_tokens) || 0;
+  statsBuf.cached_tokens += Number(u.prompt_cache_hit_tokens || u.input_tokens_details?.cached_tokens) || 0;
+  statsBuf.output_tokens += Number(u.completion_tokens || u.output_tokens) || 0;
+  scheduleStatsFlush();
+}
+
+function scheduleStatsFlush() {
+  if (statsTimer) return;
+  statsTimer = setTimeout(async () => {
+    statsTimer = null;
+    // 触发时在 fetch 内 flush(worker 全局 setTimeout 可能被冻结)
+  }, STATS_FLUSH_MS);
+}
+
+// 在请求出口调用: 距上次写超过 5 分钟才写
+async function maybeFlushStats(env) {
+  if (!env.STATS_KV) return;
+  if (Date.now() - lastStatsFlush < STATS_FLUSH_MS) return;
+  lastStatsFlush = Date.now();
+  const key = statsKey();
+  // 读当前累计 → 合并 → 写回(仅 1 读 1 写, 频率极低)
+  let agg = { calls: 0, prompt_tokens: 0, cached_tokens: 0, output_tokens: 0 };
+  try {
+    const cur = await env.STATS_KV.get(key);
+    if (cur) agg = { ...agg, ...JSON.parse(cur) };
+  } catch {}
+  agg.calls += statsBuf.calls;
+  agg.prompt_tokens += statsBuf.prompt_tokens;
+  agg.cached_tokens += statsBuf.cached_tokens;
+  agg.output_tokens += statsBuf.output_tokens;
+  statsBuf.calls = statsBuf.prompt_tokens = statsBuf.cached_tokens = statsBuf.output_tokens = 0;
+  try {
+    await env.STATS_KV.put(key, JSON.stringify(agg), { expirationTtl: 60 * 60 * 24 * 31 }); // 31 天
+  } catch {}
+}
+
 // 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
 // 映射来源：Freebuff Desktop 0.0.51 orchestrator.js FREEBUFF_ROOT_AGENT_ID_BY_MODEL（2026-08-07 实测同步）
 const MODELS = [
@@ -46,6 +100,19 @@ export default {
         })),
         time: new Date().toISOString(),
       }, 200);
+    }
+
+    // admin 页面 + API(x-admin-auth 鉴权, 独立于 API key)
+    if (url.pathname === "/admin" || url.pathname === "/admin/") {
+      return adminHtmlResponse();
+    }
+    if (url.pathname === "/admin/api/stats") {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handleAdminStats(request, env);
+    }
+    if (url.pathname.startsWith("/admin/api/accounts/")) {
+      if (!adminAuthorized(request, env)) return jsonResponse({ error: { message: "Unauthorized", type: "auth_error" } }, 401);
+      return handleAdminAccountAction(request, url, env);
     }
 
     const key = getApiKey(request, env);
@@ -672,6 +739,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      recordStats(agg.usage);
+      await maybeFlushStats(env);
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
@@ -1126,3 +1195,174 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-freebuff-instance-id, anthropic-version, anthropic-beta",
   };
 }
+
+// ---------------------------------------------------------------------------
+// admin 鉴权 + API
+// ---------------------------------------------------------------------------
+function adminAuthorized(request, env) {
+  const adminKey = String(env.ADMIN_KEY || "").trim();
+  if (!adminKey) return false;
+  const auth = request.headers.get("x-admin-auth") || "";
+  return auth.trim() === adminKey;
+}
+
+async function handleAdminStats(request, env) {
+  // 读取当日统计(KV 已聚合) + 内存未 flush 部分
+  let today = { calls: 0, prompt_tokens: 0, cached_tokens: 0, output_tokens: 0 };
+  try {
+    const cur = await env.STATS_KV.get(statsKey());
+    if (cur) today = { ...today, ...JSON.parse(cur) };
+  } catch {}
+  today.calls += statsBuf.calls;
+  today.prompt_tokens += statsBuf.prompt_tokens;
+  today.cached_tokens += statsBuf.cached_tokens;
+  today.output_tokens += statsBuf.output_tokens;
+
+  // 账号状态
+  const accounts = parseAccounts(env).map((a) => {
+    const cd = cooldowns.get(a.token) || 0;
+    const cooling = cd > Date.now();
+    return {
+      token: a.token.slice(0, 8) + "...",
+      uid: a.uid ? a.uid.slice(0, 8) + "..." : null,
+      cooling: cooling,
+      cooldown_until: cooling ? new Date(cd).toISOString() : null,
+    };
+  });
+
+  return jsonResponse({
+    version: "1.6.6",
+    time: new Date().toISOString(),
+    stats: { date: new Date().toISOString().slice(0, 10), ...today },
+    accounts: { total: accounts.length, list: accounts },
+    models: MODELS.map((m) => m.id),
+  });
+}
+
+async function handleAdminAccountAction(request, url, env) {
+  // /admin/api/accounts/<token>/clear-cooldown 或 /delete
+  const m = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/(clear-cooldown|delete)$/);
+  if (!m) return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
+  const token = decodeURIComponent(m[1]);
+  const action = m[2];
+  if (action === "clear-cooldown") {
+    if (cooldowns.has(token)) { cooldowns.delete(token); }
+    return jsonResponse({ ok: true, action, token: token.slice(0, 8) + "..." });
+  }
+  // delete: 移除冷却 + session 缓存(令牌本身在 env 中, 无法删除, 仅本地清理)
+  cooldowns.delete(token);
+  for (const k of [...sessCache.keys()]) {
+    if (k.startsWith(token + ":")) sessCache.delete(k);
+  }
+  return jsonResponse({ ok: true, action, token: token.slice(0, 8) + "..." });
+}
+
+function adminHtmlResponse() {
+  return new Response(ADMIN_HTML, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() },
+  });
+}
+
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FREEBUFF2API // BLUEPRINT</title>
+<style>
+:root{--bg:#0a1628;--panel:#0f1f36;--line:#1e3a5f;--txt:#dbe7f5;--dim:#7d95b5;--cyan:#22d3ee;--green:#34d399;--red:#f87171;--amber:#fbbf24;--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);background-image:linear-gradient(rgba(34,211,238,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.04) 1px,transparent 1px);background-size:24px 24px;color:var(--txt);font-family:var(--mono);font-size:13px;min-height:100vh}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
+.titlebar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-bottom:14px}
+.logo{font-weight:700;font-size:14px;letter-spacing:1px;color:var(--cyan)}
+.logo span{display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;background:var(--cyan);color:#04121f;border-radius:4px;margin-right:8px;font-weight:800}
+.spacer{flex:1}
+.badge{background:rgba(34,211,238,.12);color:var(--cyan);border:1px solid rgba(34,211,238,.3);padding:3px 10px;border-radius:999px;font-size:11px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.stat .label{color:var(--dim);font-size:11px;letter-spacing:1px;text-transform:uppercase}
+.stat .value{font-size:22px;font-weight:700;color:var(--cyan);margin-top:4px}
+.stat .value small{font-size:12px;color:var(--dim);font-weight:400}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-bottom:14px}
+.card h3{font-size:12px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;padding:10px 14px;border-bottom:1px solid var(--line)}
+.card .body{padding:12px 14px}
+table{width:100%;border-collapse:collapse}
+th{color:var(--dim);text-align:left;font-weight:400;font-size:11px;text-transform:uppercase;padding:6px 10px;border-bottom:1px solid var(--line)}
+td{padding:7px 10px;border-bottom:1px solid rgba(30,58,95,.5)}
+tr:last-child td{border-bottom:none}
+.ok{color:var(--green)}.cool{color:var(--amber)}.err{color:var(--red)}
+.chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;border:1px solid}
+.chip.ok{color:var(--green);border-color:rgba(52,211,153,.4)}
+.chip.cool{color:var(--amber);border-color:rgba(251,191,36,.4)}
+.chip.err{color:var(--red);border-color:rgba(248,113,113,.4)}
+.btns{display:flex;gap:8px}
+button{background:rgba(34,211,238,.1);color:var(--cyan);border:1px solid rgba(34,211,238,.35);border-radius:5px;padding:4px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
+button:hover{background:rgba(34,211,238,.22)}
+.login-box{max-width:340px;margin:15vh auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}
+.login-box h2{color:var(--cyan);font-size:16px;margin-bottom:16px}
+input{width:100%;background:#081426;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:9px 12px;font-family:var(--mono);font-size:13px;margin-bottom:12px}
+.usage{color:var(--dim);font-size:11px;margin-top:8px;line-height:1.6}
+a{color:var(--cyan)}
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+<div class="titlebar">
+  <div class="logo"><span>F</span>FREEBUFF2API</div>
+  <div class="badge" id="ver">-</div>
+  <div class="spacer"></div>
+  <button onclick="refresh()">刷新</button>
+</div>
+<div class="stats-grid">
+  <div class="stat"><div class="label">调用次数</div><div class="value" id="s-calls">-</div></div>
+  <div class="stat"><div class="label">输入 Tokens</div><div class="value" id="s-prompt">-</div></div>
+  <div class="stat"><div class="label">缓存 Tokens</div><div class="value" id="s-cached">-</div></div>
+  <div class="stat"><div class="label">输出 Tokens</div><div class="value" id="s-output">-</div></div>
+</div>
+<div class="card"><h3>账号状态</h3><div class="body">
+<table><thead><tr><th>Token</th><th>UID</th><th>状态</th><th>操作</th></tr></thead>
+<tbody id="acct-tbody"><tr><td colspan="4" style="color:var(--dim)">加载中...</td></tr></tbody></table>
+</div></div>
+<div class="card"><h3>可用模型</h3><div class="body" id="models"><span style="color:var(--dim)">-</span></div></div>
+<div class="card"><h3>使用说明</h3><div class="body usage">
+<b>Base URL:</b> <span style="color:var(--cyan)">https://freebuff.chat2api.kdns.fr/v1</span><br>
+<b>API Key:</b> <span style="color:var(--cyan)">freebuff-default-key</span><br>
+<b>模型示例:</b> deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro, minimax/minimax-m3, mimo/mimo-v2.5, openai/gpt-5.6-luna, z-ai/glm-5.2, anthropic/claude-fable-5 等<br>
+<b>健康检查:</b> <span style="color:var(--cyan)">/healthz</span>（免鉴权）<br>
+<b>兼容:</b> OpenAI Chat Completions / Responses API, 支持 tools call(含 end_turn 签名)<br>
+<b>说明:</b> 统计按日聚合, KV 每 5 分钟批量写入一次(免费额度内)
+</div></div>
+</div>
+<script>
+let KEY=localStorage.getItem('fb2a-key')||'';
+async function api(path,opt){
+  if(!KEY){const k=prompt('输入管理员密码:');if(!k)return;KEY=k;localStorage.setItem('fb2a-key',k);}
+  opt=opt||{};opt.headers=Object.assign({'x-admin-auth':KEY},opt.headers||{});
+  const r=await fetch(path,opt);
+  if(r.status===401){localStorage.removeItem('fb2a-key');KEY='';alert('密码错误');return null;}
+  return r.json();
+}
+async function refresh(){
+  const d=await api('/admin/api/stats');if(!d)return;
+  document.getElementById('ver').textContent='v'+d.version+' · '+d.time.slice(0,19).replace('T',' ');
+  const s=d.stats||{};
+  document.getElementById('s-calls').innerHTML=s.calls+(s.calls?'<small> 次</small>':'');
+  document.getElementById('s-prompt').textContent=(s.prompt_tokens||0).toLocaleString();
+  document.getElementById('s-cached').textContent=(s.cached_tokens||0).toLocaleString();
+  document.getElementById('s-output').textContent=(s.output_tokens||0).toLocaleString();
+  const tb=document.getElementById('acct-tbody');tb.innerHTML='';
+  (d.accounts.list||[]).forEach(a=>{
+    const st=a.cooling?'<span class="chip cool">冷却中</span>':'<span class="chip ok">正常</span>';
+    const btn=a.cooling?'<button onclick="clearCd(\''+a.token+'\')">解除冷却</button>':'<button onclick="delAcct(\''+a.token+'\')">清理</button>';
+    tb.insertAdjacentHTML('beforeend','<tr><td>'+a.token+'</td><td>'+(a.uid||'-')+'</td><td>'+st+'</td><td>'+btn+'</td></tr>');
+  });
+  document.getElementById('models').innerHTML=(d.models||[]).map(m=>'<span class="chip ok" style="margin:2px">'+m+'</span>').join(' ');
+}
+async function clearCd(t){await api('/admin/api/accounts/'+encodeURIComponent(t)+'/clear-cooldown',{method:'POST'});refresh();}
+async function delAcct(t){if(confirm('确认清理该账号的本地会话?')){await api('/admin/api/accounts/'+encodeURIComponent(t)+'/delete',{method:'POST'});refresh();}}
+refresh();setInterval(refresh,30000);
+</script>
+</body>
+</html>`;
