@@ -363,6 +363,11 @@ function modelPoolCategory(modelId) {
     if (dyn.pool.glm.has(modelId)) return "glm";
     if (dynamicStandardModels().has(modelId)) return "standard";
   }
+  // 硬编码兜底
+  if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
+  if (STANDARD_MODELS.has(modelId)) return "standard";
+  return null;
+}
 
 
 // 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
