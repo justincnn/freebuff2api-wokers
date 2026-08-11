@@ -57,6 +57,314 @@ async function maybeFlushStats(env) {
   } catch {}
 }
 
+// 动态模型注册表：从官方 freebuff 镜像拉取模型清单
+// 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
+// 与 Freebuff Desktop 0.0.51 orchestrator.js 的 FREEBUFF_ROOT_AGENT_ID_BY_MODEL 同源
+// （镜像常量 = 桌面版同源源码，安装包只是编译产物）
+// 需要 3 个源（常量分散定义）：
+//   1. free-agents.ts       → FREEBUFF_ROOT_AGENT_ID_BY_MODEL（模型→agent 映射）
+//   2. freebuff-models.ts   → 大部分模型 ID 常量 + 池定义（PREMIUM/GLM）
+//   3. freebuff-model-ids.ts→ deepseek/m3 等 ID 常量（被 models.ts re-export）
+// 每源都有 raw 主源 + jsDelivr 备用
+const DYNAMIC_MODELS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/free-agents.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/free-agents.ts",
+];
+const DYNAMIC_MODELS_MODEL_IDS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-models.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-models.ts",
+];
+const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-ids.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-ids.ts",
+];
+// Releases 兜底源：GitHub Actions 每天生成的解析好的 JSON（无需解析，直接可用）
+// 当官方 3 个源全部失败/解析失败时使用。比 raw.githubusercontent 更稳（GitHub CDN）。
+// 已实测（2026-08-11）：releases/latest/download 地址 HTTP 200，内容正确。
+const DYNAMIC_MODELS_RELEASE_SOURCES = [
+  "https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json",
+];
+// 刷新间隔：与 Quorinex 对齐，6 小时。失败时回退到硬编码 MODELS。
+const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
+const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
+
+// 运行时动态模型缓存（内存，无 KV）
+let dynamicModelsCache = {
+  fetchedAt: 0,
+  models: null, // 动态模型表（含分类）
+  pool: null, // { premium: Set, standard: Set, glm: Set }
+};
+
+// 解析 freebuff-models.ts 的模型 ID 常量
+// 形如:
+//   export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
+//   export const FREEBUFF_MINIMAX_M3_MODEL_ID = 'minimax/minimax-m3'
+// 兼容: 'string' | 标识符.成员（取成员名查 knownDefaults）| 标识符
+function parseModelIdConstants(source) {
+  const table = {};
+  const knownDefaults = {
+    mimoV25: "mimo/mimo-v2.5",
+  };
+  // 匹配 export const NAME = 'value' 或 export const NAME = expr
+  const re = /export\s+const\s+([A-Z0-9_]+)\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_.]+))/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    const name = m[1];
+    const lit = m[2] ?? m[3] ?? "";
+    const expr = m[4] ?? "";
+    if (lit) table[name] = lit;
+    else if (expr) {
+      // 标识符.成员 → 取成员名（mimoModels.mimoV25 → mimoV25）
+      const member = expr.includes(".") ? expr.split(".").pop() : expr;
+      if (knownDefaults[member]) table[name] = knownDefaults[member];
+      else if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.:/-]+$/.test(expr)) table[name] = expr;
+    }
+  }
+  return table;
+}
+
+// 解析 free-agents.ts 中按用途分开的 agent 映射。
+// 不把 base2 root、base3 root、reviewer 混为一张表：它们属于不同运行路径。
+function parseAgentMappings(source, modelIdConstants) {
+  const blockNames = {
+    root: "FREEBUFF_ROOT_AGENT_ID_BY_MODEL",
+    base3: "FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL",
+    reviewer: "FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL",
+  };
+  const result = { root: {}, base3: {}, reviewer: {} };
+  const lineRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*'([^']+)'/g;
+  for (const [kind, blockName] of Object.entries(blockNames)) {
+    const blockRe = new RegExp(`${blockName}[^=]*=\\s*\\{([^}]*)\\}`);
+    const blockMatch = blockRe.exec(source);
+    if (!blockMatch) continue;
+    let m;
+    lineRe.lastIndex = 0;
+    while ((m = lineRe.exec(blockMatch[1])) !== null) {
+      const modelId = modelIdConstants[m[1]];
+      if (modelId) result[kind][modelId] = m[2];
+    }
+  }
+  return result;
+}
+
+// 兼容旧调用方：默认返回普通 base2 root 映射。
+function parseAgentMapping(source, modelIdConstants) {
+  return parseAgentMappings(source, modelIdConstants).root;
+}
+
+// 解析 freebuff-models.ts 的池定义（PREMIUM / GLM；STANDARD 由 non-premium 推导）
+// FREEBUFF_WEB_PREMIUM_MODEL_IDS 含 spread（...FREEBUFF_PREMIUM_MODEL_IDS）
+function parseModelPools(source, modelIdConstants) {
+  const premium = new Set();
+  const glm = new Set();
+  const used = new Set();
+  // 展开 spread: ...FOO → FOO 里的条目（常量名 → 值）
+  const constValues = new Map();
+  const constListRe = /export\s+const\s+([A-Z0-9_]+)\s*=\s*\[([^\]]*)\]\s*as\s*const/g;
+  let cm;
+  while ((cm = constListRe.exec(source)) !== null) {
+    const name = cm[1];
+    const items = [];
+    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+    let im;
+    while ((im = itemRe.exec(cm[2])) !== null) {
+      const spread = im[1];
+      const lit = im[2] ?? im[3];
+      const expr = im[4];
+      if (spread) items.push(["spread", spread]);
+      else if (lit) items.push(["lit", lit]);
+      else if (expr && modelIdConstants[expr]) items.push(["lit", modelIdConstants[expr]]);
+    }
+    constValues.set(name, items);
+  }
+  // 解析池
+  const poolRe = /export\s+const\s+(FREEBUFF_WEB_PREMIUM_MODEL_IDS|FREEBUFF_GLM_V52_MODEL_IDS|FREEBUFF_PREMIUM_MODEL_IDS)\s*=\s*\[([^\]]*)\]/g;
+  let pm;
+  while ((pm = poolRe.exec(source)) !== null) {
+    const poolName = pm[1];
+    const items = [];
+    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+    let im;
+    while ((im = itemRe.exec(pm[2])) !== null) {
+      const spread = im[1];
+      const lit = im[2] ?? im[3];
+      const expr = im[4];
+      if (spread) {
+        // 递归展开 spread 常量
+        const expand = (n) => {
+          const entries = constValues.get(n) || [];
+          for (const [kind, val] of entries) {
+            if (kind === "spread") expand(val);
+            else items.push(val);
+          }
+        };
+        expand(spread);
+      } else if (lit) items.push(lit);
+      else if (expr && modelIdConstants[expr]) items.push(modelIdConstants[expr]);
+    }
+    if (poolName === "FREEBUFF_GLM_V52_MODEL_IDS") {
+      for (const id of items) glm.add(id);
+    } else {
+      for (const id of items) premium.add(id);
+    }
+  }
+  // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium
+  return { premium: [...premium], glm: [...glm] };
+}
+
+// 动态模型表：分别记录普通 root、base3 root、reviewer。
+function buildDynamicModelTable(agentMappings) {
+  // 兼容旧调用：传入单张 root mapping 时仍可正常构建。
+  const mappings = agentMappings && agentMappings.root
+    ? agentMappings
+    : { root: agentMappings || {}, base3: {}, reviewer: {} };
+  return Object.entries(mappings.root).map(([modelId, rootAgent]) => ({
+    id: modelId,
+    session: modelId,
+    // 旧字段保留为普通 root，普通 chat 永远使用它。
+    agent: rootAgent,
+    root_agent: rootAgent,
+    base3_agent: mappings.base3[modelId] || null,
+    reviewer_agent: mappings.reviewer[modelId] || null,
+    upstream: modelId,
+  }));
+}
+
+// 合并硬编码与动态表：硬编码优先（不覆盖），动态新增追加
+function mergeModelTables(hardcoded, dynamic) {
+  const seen = new Set(hardcoded.map((m) => m.id));
+  const merged = [...hardcoded];
+  for (const m of dynamic) {
+    if (!seen.has(m.id)) {
+      merged.push(m);
+      seen.add(m.id);
+    }
+  }
+  return merged;
+}
+
+// 拉取并刷新动态模型缓存（失败静默回退）
+async function fetchSourceList(urls) {
+  for (const url of urls) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const text = await resp.text();
+        // 阈值放宽：freebuff-model-ids.ts 只有 ~491B（3 个常量），
+        // 500 阈值会误杀。只过滤真正的空文件（<100B）。
+        if (text && text.length > 100) return text;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function refreshDynamicModelsIfStale() {
+  const now = Date.now();
+  if (dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
+    return dynamicModelsCache;
+  }
+  // 并行拉 3 个源（每源主 raw + 备 jsDelivr）
+  const [agentsSrc, modelsSrc, stableIdsSrc] = await Promise.all([
+    fetchSourceList(DYNAMIC_MODELS_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_MODEL_IDS_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_STABLE_IDS_SOURCES),
+  ]);
+  if (!agentsSrc || !modelsSrc) {
+    // 官方源拉取失败：尝试 Releases JSON 兜底
+    const release = await tryReleaseFallback();
+    if (release) {
+      dynamicModelsCache = release;
+      return dynamicModelsCache;
+    }
+    // Releases 也失败：保留旧缓存（若有），否则维持现状
+    return dynamicModelsCache;
+  }
+  try {
+    // 合并常量表：models.ts 优先（完整），stableIds.ts 补充 deepseek/m3
+    const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
+    const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
+    if (Object.keys(agentMappings.root).length === 0) {
+      // 解析失败：尝试 Releases 兜底
+      const release = await tryReleaseFallback();
+      if (release) {
+        dynamicModelsCache = release;
+        return dynamicModelsCache;
+      }
+      return dynamicModelsCache;
+    }
+    const pools = parseModelPools(modelsSrc, modelIdConstants);
+    dynamicModelsCache = {
+      fetchedAt: Date.now(),
+      models: buildDynamicModelTable(agentMappings),
+      pool: {
+        premium: new Set(pools.premium),
+        standard: null,
+        glm: new Set(pools.glm),
+      },
+    };
+  } catch {
+    // 解析崩溃：尝试 Releases 兜底
+    const release = await tryReleaseFallback();
+    if (release) {
+      dynamicModelsCache = release;
+      return dynamicModelsCache;
+    }
+    // 保留旧缓存
+  }
+  return dynamicModelsCache;
+}
+
+// Releases JSON 兜底：直接拉预生成的 models.json，零解析成本
+async function tryReleaseFallback() {
+  for (const url of DYNAMIC_MODELS_RELEASE_SOURCES) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json && Array.isArray(json.models) && json.models.length > 0) {
+          return {
+            fetchedAt: Date.now(),
+            models: json.models,
+            pool: {
+              premium: new Set(json.pools?.premium ?? []),
+              standard: null,
+              glm: new Set(json.pools?.glm ?? []),
+            },
+          };
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// 动态 STANDARD = 动态表里不在 premium/glm 池的模型
+function dynamicStandardModels() {
+  const cache = dynamicModelsCache;
+  if (!cache || !cache.models || !cache.pool) return new Set();
+  const premium = cache.pool.premium;
+  const glm = cache.pool.glm;
+  return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
+}
+
+// 模型池分类查询：动态池优先，硬编码兜底
+// 返回 "premium" | "standard" | "glm" | null
+function modelPoolCategory(modelId) {
+  const dyn = dynamicModelsCache;
+  if (dyn && dyn.pool) {
+    if (dyn.pool.premium.has(modelId)) return "premium";
+    if (dyn.pool.glm.has(modelId)) return "glm";
+    if (dynamicStandardModels().has(modelId)) return "standard";
+  }
+
+
 // 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
 // 映射来源：Freebuff Desktop 0.0.51 orchestrator.js FREEBUFF_ROOT_AGENT_ID_BY_MODEL（2026-08-07 实测同步）
 const MODELS = [
@@ -137,7 +445,7 @@ export default {
     cleanCache();
 
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      return handleModels();
+      return await handleModels();
     }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       return handleChat(request, env);
@@ -584,13 +892,42 @@ function buildUpstreamPayload(params, mc, sess, runId) {
 // chat 主流程
 // ---------------------------------------------------------------------------
 
+// 查找模型配置：硬编码 MODELS 优先，动态表补充（合并表）
+function findModelConfig(modelId) {
+  const hit = MODELS.find((m) => m.id === modelId);
+  if (hit) return hit;
+  const dyn = dynamicModelsCache.models;
+  if (dyn) {
+    const d = dyn.find((m) => m.id === modelId);
+    if (d) return d;
+  }
+  return null;
+}
+
+// 查找模型配置前确保动态注册表已加载。
+// 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
+async function resolveModelConfig(modelId) {
+  let hit = findModelConfig(modelId);
+  if (hit) return hit;
+  try {
+    const dyn = await refreshDynamicModelsIfStale();
+    if (dyn && dyn.models) {
+      hit = dyn.models.find((m) => m.id === modelId) || null;
+      if (hit) return hit;
+    }
+  } catch {}
+  return findModelConfig(modelId);
+}
+
+
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
   const rc = await loadRuntimeConfig(env);
   const defaultModel = (rc.default_model || env.DEFAULT_MODEL || DEFAULT_MODEL);
-  const mc = MODELS.find((m) => m.id === (params.model || defaultModel)) || MODELS[0];
+  const mc = await resolveModelConfig(params.model || defaultModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + (params.model || defaultModel), type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat");
 }
 
@@ -601,7 +938,8 @@ async function handleResponses(request, env) {
   const isStream = !!params.stream;
   const rc = await loadRuntimeConfig(env);
   const defaultModel = (rc.default_model || env.DEFAULT_MODEL || DEFAULT_MODEL);
-  const mc = MODELS.find((m) => m.id === (params.model || defaultModel)) || MODELS[0];
+  const mc = await resolveModelConfig(params.model || defaultModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + (params.model || defaultModel), type: "unsupported_model" } }, 400);
   return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
 }
 
@@ -1197,11 +1535,13 @@ function cleanCache() {
 // ⚠️ 不要在这里查上游 GET /api/v1/freebuff/session（额度/状态）：
 // 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
 // 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
-function handleModels() {
+async function handleModels() {
+  const dyn = await refreshDynamicModelsIfStale();
+  const modelList = (dyn && dyn.models && dyn.models.length) ? mergeModelTables(MODELS, dyn.models) : MODELS;
   return jsonResponse({
     object: "list",
-    data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.6" });
+    data: modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+  }, 200, { "X-Freebuff2api-Version": "1.8.4" });
 }
 
 async function getApiKey(request, env) {
